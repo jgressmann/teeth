@@ -1144,22 +1144,20 @@ static bool fetch_stats(app* app)
     assert(app);
 
     struct {
-           struct nlmsghdr  nh;
+           struct nlmsghdr nh;
            struct ifinfomsg info;
-           struct rtattr attr;
     } request;
     _Alignas(struct nlmsghdr) uint8_t response_buffer[4096];
 
     memset(&request, 0, sizeof(request));
 
-    request.nh.nlmsg_len = NLMSG_ALIGN(NLMSG_LENGTH(sizeof(request.info))) + sizeof(request.attr);
+    request.nh.nlmsg_len = NLMSG_LENGTH(sizeof(request.info));
     request.nh.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
     request.nh.nlmsg_type = RTM_GETLINK;
     request.nh.nlmsg_seq = ++app->netlink_seq_no;
     request.info.ifi_index = app->nic_index;
     request.info.ifi_change = 0xffffffff; // reserved for future use
     request.info.ifi_family = AF_UNSPEC;
-    request.attr.rta_type = IFLA_STATS;
 
 
     // submit request
