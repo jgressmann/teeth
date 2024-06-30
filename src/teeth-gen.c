@@ -258,8 +258,8 @@ parse_src_mac:
         case 0x100:
             target_frame_length = strtoll(optarg, NULL, 10);
 
-            if (target_frame_length <= MIN_FRAME_LENGTH) {
-                log_error("frame length '%s' invalid (min. length is %d bytes)\n", optarg, MIN_FRAME_LENGTH);
+            if (target_frame_length < 0) {
+                log_error("frame length '%s' invalid (min. ethernet length is %d bytes)\n", optarg, MIN_FRAME_LENGTH);
                 error = 1;
                 goto Exit;
             }
@@ -585,7 +585,7 @@ parse_src_mac:
                     ++tx_counter;
 
                     if (want_count > 0 && (uint64_t)want_count == tx_counter) {
-                        log_debug3("target count of %ld reached, quitting", want_count);
+                        log_debug3("target count of %ld reached, quitting\n", want_count);
                         goto Exit;
                     }
                 } else if (teeth_signal_handler_fd == events[i].data.fd) {

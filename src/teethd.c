@@ -68,7 +68,7 @@ enum {
     FD_SLOT_TYPE_TCP,
 };
 
-struct teeth_ethtool_stats {
+struct teeth_nic_stats {
     uint64_t tx_packets;
     uint64_t rx_packets;
     uint64_t tx_errors;
@@ -82,8 +82,8 @@ struct tcp_slot {
     int tcp_send_buffer_size;
     int w_pipe_open;
     int r_pipe_open;
-    int tx_error_code; // FIX ME
-    struct teeth_ethtool_stats stats;
+    int tx_error_code;
+    struct teeth_nic_stats stats;
     size_t rx_offset;
     struct iovec iov_buffer[2];
     size_t iov_count;
@@ -115,8 +115,8 @@ typedef struct app {
     uint8_t* packet_ring_rx_ptr;
     uint8_t* packet_ring_tx_ptr;
     size_t packet_ring_rx_block_current; // not an index
-    size_t packet_ring_tx_frame_put_no; // not an index
-    size_t packet_ring_tx_frame_get_no; // not an index
+    size_t packet_ring_tx_frame_put_no;  // not an index
+    size_t packet_ring_tx_frame_get_no;  // not an index
     size_t frames_per_block;
     size_t packet_ring_tx_frames_queued;
     struct tpacket_req3 packet_ring_setup;
@@ -125,12 +125,6 @@ typedef struct app {
     struct ifreq ifr;
     struct ethtool_link_settings* glink_settings;
     unsigned glink_settings_link_mode_mask_words;
-    unsigned ethtool_gstats_tx_packets_index;
-    unsigned ethtool_gstats_rx_packets_index;
-    unsigned ethtool_gstats_tx_errors_index;
-    unsigned ethtool_gstats_rx_errors_index;
-    unsigned ethtool_gstats_rx_missed_index;
-    struct ethtool_stats* gstats;
     struct teeth_eth_stats_hdr stats_hdr;
     struct rtnl_link_stats rtnetlink_stats;
 } app;
@@ -156,7 +150,6 @@ static inline void fd_slot_uninit(app* app, int fd)
         break;
     }
 }
-
 
 static inline void app_uninit(struct app* app)
 {
@@ -196,7 +189,6 @@ static inline void app_uninit(struct app* app)
     app->fd_slot_capacity = 0;
 }
 
-
 static inline void app_init(struct app* app)
 {
     memset(app, 0, sizeof(*app));
@@ -211,16 +203,7 @@ static inline void app_init(struct app* app)
     app->stats_hdr.base.version = TEETH_PROTOCOL_VERSION;
 }
 
-static inline void app_assign_ethtool_stats(app* app, struct teeth_ethtool_stats* stats)
-{
-    stats->tx_packets = app->gstats->data[app->ethtool_gstats_tx_packets_index];
-    stats->rx_packets = app->gstats->data[app->ethtool_gstats_rx_packets_index];
-    stats->tx_errors = app->gstats->data[app->ethtool_gstats_tx_errors_index];
-    stats->rx_errors = app->gstats->data[app->ethtool_gstats_rx_errors_index];
-    stats->rx_missed = app->gstats->data[app->ethtool_gstats_rx_missed_index];
-}
-
-static inline void app_assign_rtnetlink_stats(app* app, struct teeth_ethtool_stats* stats)
+static inline void app_assign_rtnetlink_stats(app const* app, struct teeth_nic_stats* stats)
 {
     stats->tx_packets = app->rtnetlink_stats.tx_packets;
     stats->rx_packets = app->rtnetlink_stats.rx_packets;
@@ -228,8 +211,6 @@ static inline void app_assign_rtnetlink_stats(app* app, struct teeth_ethtool_sta
     stats->rx_errors = app->rtnetlink_stats.rx_errors;
     stats->rx_missed = app->rtnetlink_stats.rx_dropped + app->rtnetlink_stats.rx_missed_errors;
 }
-
-
 
 
 #define TX_PRIVATE_DATA_SIZE 16
@@ -284,10 +265,7 @@ static inline void tcp_on_r_pipe_closed(app* app, int fd) {
 
     struct tcp_slot *tcp = app->fd_slot_ptr[fd].data.tcp;
 
-    if (tcp->r_pipe_open) {
-        tcp->r_pipe_open = 0;
-        tcp_on_change(app, fd);
-    }
+    tcp->r_pipe_open = 0;
 }
 
 static inline void tcp_on_w_pipe_closed(app* app, int fd) {
@@ -300,10 +278,7 @@ static inline void tcp_on_w_pipe_closed(app* app, int fd) {
 
     struct tcp_slot *tcp = app->fd_slot_ptr[fd].data.tcp;
 
-    if (tcp->w_pipe_open) {
-        tcp->w_pipe_open = 0;
-        tcp_on_change(app, fd);
-    }
+    tcp->w_pipe_open = 0;
 }
 
 static inline void on_tcp_send_failed(app* app, int fd)
@@ -358,9 +333,7 @@ int main(int argc, char** argv)
     _Alignas(8) uint8_t packet_rx_frame_buffer[TEETH_MAX_ETHER_PACKET_SIZE];
 
 
-
     memset(&listen_socket_address, 0, sizeof(listen_socket_address));
-
     app_init(&app);
 
     for (int option_index = 0;;) {
@@ -660,7 +633,6 @@ int main(int argc, char** argv)
                     struct teeth_eth_stats_hdr stats;
 
                     if (unlikely(!timerfd_drain(stats_timer_fd))) {
-                        sys_error("getsocketopt SO_ERROR");
                         error = 2;
                         goto Exit;
                     }
@@ -747,13 +719,16 @@ static bool tcp_send(app* app, int fd, void const* ptr, size_t bytes)
             switch (errno) {
             case EINTR:
                 break;
+            case EAGAIN:
+                return false;
             default:
+                tcp_on_w_pipe_closed(app, fd);
                 return false;
             }
         } else if (0 == w) {
             // peer closed receive end
             tcp_on_w_pipe_closed(app, fd);
-            break;
+            return false;
         } else if ((size_t)w != bytes) {
             return false;
         } else {
@@ -773,29 +748,13 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
     assert(app->fd_slot_capacity > ev->data.fd);
     assert(app->fd_slot_ptr[ev->data.fd].type == FD_SLOT_TYPE_TCP);
 
+    bool bad_client = false;
+    bool connection_error = false;
     int const fd = ev->data.fd;
-
     struct tcp_slot *tcp = app->fd_slot_ptr[fd].data.tcp;
 
 
-    if (ev->events & EPOLLHUP) {
-        tcp_on_r_pipe_closed(app, fd);
-    }
-
-    if (ev->events & EPOLLRDHUP) {
-        tcp_on_w_pipe_closed(app, fd);
-    }
-
-    if (ev->events & EPOLLERR) {
-        tcp_gone(app, fd);
-        assert(FD_SLOT_TYPE_FREE == app->fd_slot_ptr[fd].type);
-    }
-
-    if (FD_SLOT_TYPE_FREE == app->fd_slot_ptr[fd].type) {
-        // cleared due to connection closed, error, etc.
-        return true;
-    }
-
+    // Even with read pipe closed, there may be data left to read.
 
     for (;;) {
         struct teeth_base_hdr* const base = (struct teeth_base_hdr*)tcp->rx_buffer;
@@ -812,7 +771,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                     case EAGAIN:
                         goto client_done;
                     default:
-                        fd_slot_uninit(app, fd);
+                        connection_error = true;
                         goto client_done;
                     }
                 } else if (0 == r) {
@@ -832,7 +791,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                         case TEETH_PROTOCOL_VERSION:
                             if (base->len < sizeof(*base)) {
                                 log_debug1("bad header of %u bytes (%d)\n", base->len, fd);
-                                fd_slot_uninit(app, fd);
+                                bad_client = true;
                                 goto client_done;
                             } else {
                                 switch (base->msg_type) {
@@ -841,7 +800,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
 
                                     if (frame_len > TEETH_MAX_ETHER_PACKET_SIZE) {
                                         log_error("client (%d) sent TX request beyond TEETH_MAX_ETHER_PACKET_SIZE\n", fd);
-                                        fd_slot_uninit(app, fd);
+                                        bad_client = true;
                                         goto client_done;
                                     }
 
@@ -855,7 +814,11 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                                         tcp->iov_buffer[1].iov_base = frame_base + TPACKET_ALIGN(sizeof(*phdr));
                                         tcp->iov_buffer[1].iov_len = frame_len;
                                         tcp->iov_count = 2;
-                                        tcp->tx_error_code = TEETH_TX_ERROR_NONE;
+                                        if (unlikely(frame_len < 64)) {
+                                            tcp->tx_error_code = TEETH_TX_ERROR_TOO_SMALL;
+                                        } else {
+                                            tcp->tx_error_code = TEETH_TX_ERROR_NONE;
+                                        }
                                      } else {
                                          // fail, need to read out data
                                          tcp->iov_buffer[0].iov_base = tcp->rx_buffer + sizeof(*base);
@@ -880,7 +843,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                                 break;
                             default:
                                 log_debug1("unhandled protocol version %u (%d)\n", base->version, fd);
-                                fd_slot_uninit(app, fd);
+                                bad_client = true;
                                 goto client_done;
                             }
                         }
@@ -900,11 +863,13 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                     case EAGAIN:
                         goto client_done;
                     default:
-                        fd_slot_uninit(app, fd);
+                        connection_error = true;
                         goto client_done;
                     }
                 } else if (0 == r) {
-                    fd_slot_uninit(app, fd);
+                    tcp->rx_offset = 0;
+                    tcp->state = STATE_READ_HEADER;
+                    tcp_on_r_pipe_closed(app, fd);
                     goto client_done;
                 } else {
                     size_t active_index = 0;
@@ -958,6 +923,28 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
 
                    ++app->packet_ring_tx_frame_put_no;
                    ++app->packet_ring_tx_frames_queued;
+                } else {
+                    int const tx_error_code = tcp->tx_error_code;
+
+                    tcp->tx_error_code = 0;
+                    log_debug1("tx error=%d fd=%d\n", tx_error_code, fd);
+
+                    if (!(tx_hdr->flags & TEETH_TX_FLAG_SUPPRESS_RESPONSE)) {
+                        struct teeth_eth_tx_res_hdr tx_res_hdr;
+
+                        tx_res_hdr.base.len = sizeof(tx_hdr);
+                        tx_res_hdr.base.msg_type = TEETH_MT_ETH_TX_RES;
+                        tx_res_hdr.base.version = TEETH_PROTOCOL_VERSION;
+                        tx_res_hdr.track_id = tx_hdr->track_id;
+                        tx_res_hdr.error = tx_error_code;
+
+                        teeth_net_to_host_base(&tx_res_hdr.base);
+                        teeth_net_to_host_eth_tx_res(&tx_res_hdr);
+
+                        if (!tcp_send(app, fd, &tx_res_hdr, sizeof(tx_res_hdr))) {
+                            goto client_done;
+                        }
+                    }
                 }
             } break;
             case TEETH_MT_ECHO: {
@@ -975,7 +962,6 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                 tcp_cork(fd);
 
                 if (!tcp_send(app, fd, &hdr, sizeof(hdr))) {
-                    on_tcp_send_failed(app, fd);
                     goto client_done;
                 }
 
@@ -1012,7 +998,6 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                 teeth_net_to_host_eth_mtu(&hdr);
 
                 if (!tcp_send(app, fd, &hdr, sizeof(hdr))) {
-                    on_tcp_send_failed(app, fd);
                     goto client_done;
                 }
             } break;
@@ -1024,7 +1009,24 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
         }
     }
 client_done:
-    ;
+    if (unlikely(bad_client)) {
+        fd_slot_uninit(app, fd);
+    } else {
+        if (ev->events & EPOLLHUP) {
+            tcp_on_r_pipe_closed(app, fd);
+        }
+
+        if (ev->events & EPOLLRDHUP) {
+            tcp_on_w_pipe_closed(app, fd);
+        }
+
+        if (connection_error || (ev->events & EPOLLERR)) {
+            tcp_gone(app, fd);
+            assert(FD_SLOT_TYPE_FREE == app->fd_slot_ptr[fd].type);
+        } else if (FD_SLOT_TYPE_TCP == app->fd_slot_ptr[fd].type) {
+            tcp_on_change(app, fd);
+        }
+    }
 
     return true;
 }
@@ -1076,7 +1078,7 @@ static bool epoll_reserve(app* app, size_t count)
 static bool fetch_stats_glinksettings(app* app)
 {
     assert(app);
-    assert(app->gstats);
+
 
     struct ethtool_value value;
 
@@ -1087,13 +1089,6 @@ static bool fetch_stats_glinksettings(app* app)
 
     if (-1 == ioctl(app->packet_socket_rx_fd, SIOCETHTOOL, &app->ifr)) {
         sys_error("ioctl SIOCETHTOOL, ETHTOOL_GLINK");
-        return false;
-    }
-
-    app->ifr.ifr_data = (caddr_t)app->gstats;
-
-    if (-1 == ioctl(app->packet_socket_rx_fd, SIOCETHTOOL, &app->ifr)) {
-        sys_error("ioctl SIOCETHTOOL, ETHTOOL_GSTATS");
         return false;
     }
 
@@ -1252,9 +1247,8 @@ static void send_stats(app* app, int fd)
 
     struct teeth_eth_stats_hdr stats_hdr;
     struct tcp_slot* tcp = app->fd_slot_ptr[fd].data.tcp;
-    struct teeth_ethtool_stats estats;
+    struct teeth_nic_stats estats;
 
-//    app_assign_ethtool_stats(app, &estats);
     app_assign_rtnetlink_stats(app, &estats);
 
 
@@ -1265,15 +1259,16 @@ static void send_stats(app* app, int fd)
     stats_hdr.rx_errors = estats.rx_errors - tcp->stats.rx_errors;
     stats_hdr.rx_missed = estats.rx_missed - tcp->stats.rx_missed;
 
-
     // update client copy of counters
     tcp->stats = estats;
 
-    teeth_net_to_host_base(&stats_hdr.base);
-    teeth_net_to_host_stats(&stats_hdr);
+    if (likely(tcp->w_pipe_open)) {
+        teeth_net_to_host_base(&stats_hdr.base);
+        teeth_net_to_host_stats(&stats_hdr);
 
-    if (!tcp_send(app, fd, &stats_hdr, sizeof(stats_hdr))) {
-        on_tcp_send_failed(app, fd);
+        if (!tcp_send(app, fd, &stats_hdr, sizeof(stats_hdr))) {
+            tcp_on_change(app, fd);
+        }
     }
 }
 
@@ -1335,7 +1330,7 @@ static bool init_client(app* app, int fd)
         goto Cleanup;
     }
 
-    app_assign_ethtool_stats(app, &tcp->stats);
+    app_assign_rtnetlink_stats(app, &tcp->stats);
 
     log_debug1("client connected (%d)\n", fd);
 
@@ -1737,19 +1732,6 @@ static bool configure_nic(app* app)
                         log_debug1("%s string set index %u, string index %u: %s\n", app->nic_name, ss, j, str);
 
                         switch (ss) {
-                        case ETH_SS_STATS: {
-                            if (0 == strcmp("tx_packets", str)) {
-                                app->ethtool_gstats_tx_packets_index = j;
-                            } else if (0 == strcmp("rx_packets", str)) {
-                                app->ethtool_gstats_rx_packets_index = j;
-                            } else if (0 == strcmp("tx_errors", str)) {
-                                app->ethtool_gstats_tx_errors_index = j;
-                            } else if (0 == strcmp("rx_errors", str)) {
-                                app->ethtool_gstats_rx_errors_index = j;
-                            } else if (0 == strcmp("rx_missed", str)) {
-                                app->ethtool_gstats_rx_missed_index = j;
-                            }
-                        } break;
                         case ETH_SS_FEATURES: {
                             if (0 == strcmp("rx-fcs", str)) {
                                 rx_fcs_index = j;
@@ -1794,13 +1776,6 @@ static bool configure_nic(app* app)
                 log_warn("%s failed to disable %s\n", app->nic_name, "tx-generic-segmentation");
             }
         }
-    }
-
-    if (stats_set_length != FEATURE_NOT_FOUND) {
-//        log_error("%s failed to find ETH_SS_STATS\n", app->nic_name);
-//        return false;
-        app->gstats = calloc(1, sizeof(*app->gstats) + stats_set_length * 8);
-        app->gstats->cmd = ETHTOOL_GSTATS;
     }
 
     app->mtu = DEFAULT_MTU;
