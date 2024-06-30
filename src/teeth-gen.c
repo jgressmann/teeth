@@ -38,6 +38,7 @@ enum tristate {
 static void usage(FILE* stream)
 {
     fprintf(stream, "teeth [OPTIONS] HOST PORT\n\n");
+    fprintf(stream, "      --close-read-half  \n");
     fprintf(stream, "  -d, --dst-mac MAC      default (ff:ff:ff:ff:ff:ff)\n");
     fprintf(stream, "  -h, --help             print this help\n");
     fprintf(stream, "  -e, --ether-type HEX   ether type (default %04x)\n", DEFAULT_ETHER_TYPE);
@@ -152,6 +153,7 @@ int main(int argc, char** argv)
     uint8_t src_mac[6];
     uint8_t dst_mac[6];
     bool randomize_src_mac = true;
+    bool close_read_half = false;
     long gen_interval_ms = DEFAULT_GEN_INTERVAL_MS;
     long target_frame_length = DEFAULT_FRAME_LENGTH;
     _Alignas(8) uint8_t tx_buffer[TEETH_MAX_ETHER_PACKET_SIZE + sizeof(struct teeth_eth_tx_req_hdr)];
@@ -171,15 +173,16 @@ int main(int argc, char** argv)
 
     for (int option_index = 0;;) {
         static const struct option long_options[] = {
-            {"dst-mac",     required_argument,  NULL, 'd' },
-            {"ether-type",  required_argument,  NULL, 'e' },
-            {"length",      required_argument,  NULL, 0x100 },
-            {"local",       no_argument      ,  NULL, 'l' },
-            {"help",        no_argument,        NULL, 'h' },
-            {"multicast",   no_argument,        NULL, 'm' },
-            {"verbose",     no_argument,        NULL, 'v' },
-            {"src-mac",     required_argument,  NULL, 's' },
-            {NULL,          0,                  NULL, 0 }
+            {"close-read-half", no_argument      ,  NULL, 0x101 },
+            {"dst-mac",         required_argument,  NULL, 'd' },
+            {"ether-type",      required_argument,  NULL, 'e' },
+            {"length",          required_argument,  NULL, 0x100 },
+            {"local",           no_argument      ,  NULL, 'l' },
+            {"help",            no_argument,        NULL, 'h' },
+            {"multicast",       no_argument,        NULL, 'm' },
+            {"verbose",         no_argument,        NULL, 'v' },
+            {"src-mac",         required_argument,  NULL, 's' },
+            {NULL,              0,                  NULL, 0 }
         };
 
         int c = getopt_long(argc, argv, "d:e:g:hn:s:v", long_options, &option_index);
@@ -263,6 +266,9 @@ parse_src_mac:
                 error = 1;
                 goto Exit;
             }
+            break;
+        case 0x101:
+            close_read_half = true;
             break;
         default:
             printf("?? getopt returned character code 0%o ??\n", c);
@@ -384,12 +390,14 @@ parse_src_mac:
 //        log_warn("failed to disable lingering\n");
 //    }
 
-//    // shut down read half
-//    if (-1 == shutdown(sock_fd, SHUT_RD)) {
-//        sys_error("failed to shut down read half");
-//        error = 2;
-//        goto Exit;
-//    }
+    if (close_read_half) {
+        // shut down read half
+        if (-1 == shutdown(sock_fd, SHUT_RD)) {
+            sys_error("failed to shut down read half");
+            error = 2;
+            goto Exit;
+        }
+    }
 
     if (!sock_keep_alive(sock_fd)) {
         log_warn("failed to enable keep-alive\n");

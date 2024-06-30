@@ -2,10 +2,6 @@
  *
  * Copyright (c) 2024 Jean Gressmann <jean@0x42.de>
  *
- *//* SPDX-License-Identifier: MIT
- *
- * Copyright (c) 2024 Jean Gressmann <jean@0x42.de>
- *
  */
 
 #define _GNU_SOURCE
@@ -17,6 +13,7 @@
 #include <sys/epoll.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <netdb.h>
 
 #include "lib.h"
@@ -29,6 +26,7 @@ static void usage(FILE* stream)
     fprintf(stream, "teeth-dump [OPTIONS] HOST PORT\n\n");
     fprintf(stream, "-l, --length           number of bytes to print (default %d)\n", DEFAULT_LENGTH);
     fprintf(stream, "-v, --verbose          increase verbosity\n");
+    fprintf(stream, "    --close-write-half \n");
     fprintf(stream, "\n");
 }
 
@@ -49,6 +47,7 @@ int main(int argc, char** argv)
     int epoll_fd = -1;
     int print_len = DEFAULT_LENGTH;
     int state = STATE_READ_HEADER;
+    bool close_write_half = false;
     struct addrinfo* addresses = NULL;
     struct epoll_event events[2];
     size_t rx_offset = 0;
@@ -57,9 +56,11 @@ int main(int argc, char** argv)
 
     for (int option_index = 0;;) {
         static const struct option long_options[] = {
-            {"length",      required_argument,  0, 'l' },
-            {"verbose",     no_argument,        0, 'v' },
-            {0,             0,                  0, 0 }
+            {"close-write-half",    no_argument,        0, 0x100 },
+            {"length",              required_argument,  0, 'l' },
+            {"verbose",             no_argument,        0, 'v' },
+
+            {0,                     0,                  0, 0 }
         };
 
         int c = getopt_long(argc, argv, "l:v", long_options, &option_index);
@@ -82,6 +83,9 @@ int main(int argc, char** argv)
         } break;
         case 'v':
             ++g_log_level;
+            break;
+        case 0x100:
+            close_write_half = true;
             break;
         default:
             usage(stderr);
@@ -163,12 +167,14 @@ int main(int argc, char** argv)
         goto Exit;
     }
 
-//    // shut down write half
-//    if (-1 == shutdown(sock_fd, SHUT_WR)) {
-//        sys_error("failed to shut down write half");
-//        error = 2;
-//        goto Exit;
-//    }
+    if (close_write_half) {
+        // shut down write half
+        if (-1 == shutdown(sock_fd, SHUT_WR)) {
+            sys_error("failed to shut down write half");
+            error = 2;
+            goto Exit;
+        }
+    }
 
     if (!teeth_signal_handler_init()) {
         sys_error("failed to initialize signal handler");

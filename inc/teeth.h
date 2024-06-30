@@ -86,9 +86,10 @@ struct teeth_eth_tx_req_hdr {
 
 #define TEETH_TX_ERROR_NONE         0 /* no error occurred */
 #define TEETH_TX_ERROR_TOO_BIG      1 /* frame to big for transmission */
-#define TEETH_TX_ERROR_TOO_SMALL    2 /* frame to small for transmission */
-#define TEETH_TX_ERROR_MALFORMED    3 /* frame is malformed */
-#define TEETH_TX_ERROR_QUEUE_FULL   4 /* tx queue is full */
+#define TEETH_TX_ERROR_MALFORMED    2 /* frame is malformed */
+#define TEETH_TX_ERROR_QUEUE_FULL   3 /* tx queue is full */
+#define TEETH_TX_ERROR_TOO_SMALL    4 /* frame to small for transmission */
+#define TEETH_TX_ERROR_LINK_DOWN    5 /* link is down */
 
 /* TX respponse header */
 struct teeth_eth_tx_res_hdr {

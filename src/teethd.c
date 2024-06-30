@@ -44,6 +44,9 @@
 
 #define DEFAULT_PORT 12345
 #define DEFAULT_MTU 1500
+#define ETH_MIN_FRAME_LEN 64
+
+
 
 static void usage(FILE* stream)
 {
@@ -121,7 +124,6 @@ typedef struct app {
     size_t packet_ring_tx_frames_queued;
     struct tpacket_req3 packet_ring_setup;
     uint32_t rx_flags;
-    uint16_t mtu;
     struct ifreq ifr;
     struct ethtool_link_settings* glink_settings;
     unsigned glink_settings_link_mode_mask_words;
@@ -223,6 +225,7 @@ struct tx_ring_frame_data_priv {
             int fd;
             uint16_t echo;
             uint16_t track_id;
+            uint16_t error;
         } tx_res;
         uint8_t padding[TX_PRIVATE_DATA_SIZE];
     };
@@ -630,8 +633,6 @@ int main(int argc, char** argv)
                         }
                     }
                 } else if (stats_timer_fd == app.event_ptr[i].data.fd) {
-                    struct teeth_eth_stats_hdr stats;
-
                     if (unlikely(!timerfd_drain(stats_timer_fd))) {
                         error = 2;
                         goto Exit;
@@ -903,31 +904,37 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                 struct teeth_eth_tx_req_hdr* tx_hdr = (struct teeth_eth_tx_req_hdr*)tcp->rx_buffer;
                 uint8_t* frame_base = app->packet_ring_tx_ptr + (app->packet_ring_tx_frame_put_no % app->packet_ring_setup.tp_frame_nr) * app->packet_ring_setup.tp_frame_size;
                 struct tpacket3_hdr* phdr = (struct tpacket3_hdr*)frame_base;
-                struct tx_ring_frame_data_priv* priv = (struct tx_ring_frame_data_priv*)(frame_base + TPACKET_ALIGN(sizeof(*phdr)));
+                struct tx_ring_frame_data_priv* priv = (struct tx_ring_frame_data_priv*)(frame_base + app->packet_ring_setup.tp_frame_size - TX_PRIVATE_DATA_SIZE);
 
                 teeth_net_to_host_eth_tx_req(tx_hdr);
 
-                if (tcp->tx_error_code == TEETH_TX_ERROR_NONE) {
+                if (likely(tcp->tx_error_code == TEETH_TX_ERROR_NONE)) {
                     assert(phdr->tp_status == TP_STATUS_AVAILABLE);
 
-                   // store track ID
-                   priv->tx_res.track_id = tx_hdr->track_id;
-                   priv->tx_res.fd = fd;
-                   priv->tx_res.generation =  app->fd_slot_ptr[fd].generation;
-                   priv->tx_res.echo = (tx_hdr->flags & TEETH_TX_FLAG_SUPPRESS_RESPONSE) == 0;
+                    if (unlikely(!app->stats_hdr.link_detected)) {
+                        tcp->tx_error_code = TEETH_TX_ERROR_LINK_DOWN;
+                    }
+                }
 
-                   phdr->tp_next_offset = 0;
-                   phdr->tp_len = tx_hdr->base.len - sizeof(*tx_hdr);
-                   __atomic_store_n(&phdr->tp_status, TP_STATUS_SEND_REQUEST, __ATOMIC_RELEASE);
-                   log_debug3("tx put i=%lu fd=%d\n", app->packet_ring_tx_frame_put_no % app->packet_ring_setup.tp_frame_nr, fd);
+                if (likely(tcp->tx_error_code == TEETH_TX_ERROR_NONE)) {
+                    // store track ID
+                    priv->tx_res.track_id = tx_hdr->track_id;
+                    priv->tx_res.fd = fd;
+                    priv->tx_res.generation =  app->fd_slot_ptr[fd].generation;
+                    priv->tx_res.echo = (tx_hdr->flags & TEETH_TX_FLAG_SUPPRESS_RESPONSE) == 0;
+                    priv->tx_res.error = tcp->tx_error_code;
 
-                   ++app->packet_ring_tx_frame_put_no;
-                   ++app->packet_ring_tx_frames_queued;
+
+                    phdr->tp_next_offset = 0;
+                    phdr->tp_len = tx_hdr->base.len - sizeof(*tx_hdr);
+
+                    __atomic_store_n(&phdr->tp_status, TP_STATUS_SEND_REQUEST, __ATOMIC_RELEASE);
+                    log_debug3("tx put i=%lu fd=%d\n", app->packet_ring_tx_frame_put_no % app->packet_ring_setup.tp_frame_nr, fd);
+
+                    ++app->packet_ring_tx_frame_put_no;
+                    ++app->packet_ring_tx_frames_queued;
                 } else {
-                    int const tx_error_code = tcp->tx_error_code;
-
-                    tcp->tx_error_code = 0;
-                    log_debug1("tx error=%d fd=%d\n", tx_error_code, fd);
+                    log_debug1("tx error=%d fd=%d\n", tcp->tx_error_code, fd);
 
                     if (!(tx_hdr->flags & TEETH_TX_FLAG_SUPPRESS_RESPONSE)) {
                         struct teeth_eth_tx_res_hdr tx_res_hdr;
@@ -936,7 +943,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                         tx_res_hdr.base.msg_type = TEETH_MT_ETH_TX_RES;
                         tx_res_hdr.base.version = TEETH_PROTOCOL_VERSION;
                         tx_res_hdr.track_id = tx_hdr->track_id;
-                        tx_res_hdr.error = tx_error_code;
+                        tx_res_hdr.error = tcp->tx_error_code;
 
                         teeth_net_to_host_base(&tx_res_hdr.base);
                         teeth_net_to_host_eth_tx_res(&tx_res_hdr);
@@ -974,23 +981,23 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
 
                 if (hdr.mtu)  {
                     if (hdr.mtu < DEFAULT_MTU) {
-                        hdr.mtu = app->mtu;
+                        hdr.mtu = app->stats_hdr.mtu;
                         hdr.error = TEETH_MTU_ERROR_OUT_OF_RANGE;
                     } else {
                         if (-1 == ioctl(app->packet_socket_rx_fd, SIOCSIFMTU, &app->ifr)) {
                             switch (errno) {
                             default:
-                                hdr.mtu = app->mtu;
+                                hdr.mtu = app->stats_hdr.mtu;
                                 hdr.error = TEETH_MTU_ERROR_OUT_OF_RANGE;
                                 break;
                             }
                         } else {
-                            app->mtu = hdr.mtu;
+                            app->stats_hdr.mtu = hdr.mtu;
                             hdr.error = TEETH_MTU_ERROR_NONE;
                         }
                     }
                 } else {
-                    hdr.mtu = app->mtu;
+                    hdr.mtu = app->stats_hdr.mtu;
                     hdr.error = TEETH_MTU_ERROR_NONE;
                 }
 
@@ -1079,21 +1086,6 @@ static bool fetch_stats_glinksettings(app* app)
 {
     assert(app);
 
-
-    struct ethtool_value value;
-
-    value.cmd = ETHTOOL_GLINK;
-    value.data = 0;
-
-    app->ifr.ifr_data = (caddr_t)&value;
-
-    if (-1 == ioctl(app->packet_socket_rx_fd, SIOCETHTOOL, &app->ifr)) {
-        sys_error("ioctl SIOCETHTOOL, ETHTOOL_GLINK");
-        return false;
-    }
-
-    app->stats_hdr.mtu = app->mtu;
-
 fetch:
     if (app->glink_settings) {
         app->ifr.ifr_data = (caddr_t)app->glink_settings;
@@ -1118,7 +1110,6 @@ fetch:
             app->stats_hdr.speed_mbps = app->glink_settings->speed;
             app->stats_hdr.auto_negotiation = app->glink_settings->autoneg;
             app->stats_hdr.duplex = app->glink_settings->duplex;
-            app->stats_hdr.link_detected = value.data != 0;
         }
     } else {
         app->glink_settings = calloc(1, sizeof(*app->glink_settings));
@@ -1128,6 +1119,7 @@ fetch:
             goto fetch;
         } else {
             sys_error("calloc");
+            return false;
         }
     }
 
@@ -1189,6 +1181,7 @@ static bool fetch_stats(app* app)
                 break;
             case EAGAIN:
                 done = true;
+                log_error("failed to retrieve interface statistics through rtnetlink\n");
                 break;
             default:
                 sys_error("rtnetlink recv");
@@ -1213,13 +1206,19 @@ static bool fetch_stats(app* app)
                 case RTM_GETLINK:
                 case RTM_NEWLINK:
                 case RTM_DELLINK: {
+                    struct ifinfomsg* ifinfomsg = (struct ifinfomsg*) data;
+
+                    app->stats_hdr.link_detected  = (IFF_LOWER_UP & ifinfomsg->ifi_flags) == IFF_LOWER_UP;
+
                     for (struct rtattr *rta = IFLA_RTA(data); RTA_OK(rta, nh->nlmsg_len); rta = RTA_NEXT(rta, nh->nlmsg_len)) {
                         switch (rta->rta_type) {
                         case IFLA_STATS: {
                             struct rtnl_link_stats *stats = RTA_DATA(rta);
 
                             app->rtnetlink_stats = *stats;
-                            return true;
+                        } break;
+                        case IFLA_MTU: {
+                            app->stats_hdr.mtu = *(unsigned const*)RTA_DATA(rta);
                         } break;
                         }
                     }
@@ -1230,12 +1229,10 @@ static bool fetch_stats(app* app)
                 }
             }
         }
+        break;
     }
 
-    log_error("failed to retrieve interface statistics through rtnetlink\n");
-
-
-    return true;
+    return fetch_stats_glinksettings(app);
 }
 
 static void send_stats(app* app, int fd)
@@ -1460,7 +1457,7 @@ static bool on_packet_socket_event(app* app)
     while (app->packet_ring_tx_frame_get_no != app->packet_ring_tx_frame_put_no) {
         uint8_t* frame_base = app->packet_ring_tx_ptr + (app->packet_ring_tx_frame_get_no % app->packet_ring_setup.tp_frame_nr) * app->packet_ring_setup.tp_frame_size;
         struct tpacket3_hdr* phdr = (struct tpacket3_hdr*)frame_base;
-        struct tx_ring_frame_data_priv* priv = (struct tx_ring_frame_data_priv*)(frame_base + TPACKET_ALIGN(sizeof(*phdr)));
+        struct tx_ring_frame_data_priv* priv = (struct tx_ring_frame_data_priv*)(frame_base + app->packet_ring_setup.tp_frame_size - TX_PRIVATE_DATA_SIZE);
 
         tx_hdr.error = TEETH_TX_ERROR_NONE;
 
@@ -1485,6 +1482,7 @@ static bool on_packet_socket_event(app* app)
             tx_hdr.base.msg_type = TEETH_MT_ETH_TX_RES;
             tx_hdr.base.version = TEETH_PROTOCOL_VERSION;
             tx_hdr.track_id = priv->tx_res.track_id;
+            tx_hdr.error = priv->tx_res.error;
 
             teeth_net_to_host_base(&tx_hdr.base);
             teeth_net_to_host_eth_tx_res(&tx_hdr);
@@ -1778,11 +1776,11 @@ static bool configure_nic(app* app)
         }
     }
 
-    app->mtu = DEFAULT_MTU;
-    app->ifr.ifr_mtu = app->mtu;
+    app->stats_hdr.mtu = DEFAULT_MTU;
+    app->ifr.ifr_mtu = app->stats_hdr.mtu;
 
     if (-1 == ioctl(app->packet_socket_rx_fd, SIOCSIFMTU, &app->ifr)) {
-        sys_error("%s failed to set MTU to %u", app->nic_name, app->mtu);
+        sys_error("%s failed to set MTU to %u", app->nic_name, app->stats_hdr.mtu);
         return false;
     }
 
