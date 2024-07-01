@@ -85,7 +85,7 @@ extern int g_log_level;
 #define log_debug2(...) \
     do { \
         if (g_log_level >= LOG_LEVEL_DEBUG2) { \
-            fprintf(stderr, "DEBUG1: "); \
+            fprintf(stderr, "DEBUG2: "); \
             fprintf(stderr, __VA_ARGS__); \
         } \
     } while (0)
@@ -93,7 +93,7 @@ extern int g_log_level;
 #define log_debug3(...) \
     do { \
         if (g_log_level >= LOG_LEVEL_DEBUG3) { \
-            fprintf(stderr, "DEBUG1: "); \
+            fprintf(stderr, "DEBUG3: "); \
             fprintf(stderr, __VA_ARGS__); \
         } \
     } while (0)

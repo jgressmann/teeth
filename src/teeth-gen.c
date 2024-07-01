@@ -150,15 +150,18 @@ int main(int argc, char** argv)
     int tcp_send_buffer_size = -1;
     int timer_fd = -1;
     int urandom_fd = -1;
+    int state = STATE_READ_HEADER;
     uint8_t src_mac[6];
     uint8_t dst_mac[6];
     bool randomize_src_mac = true;
     bool close_read_half = false;
     long gen_interval_ms = DEFAULT_GEN_INTERVAL_MS;
     long target_frame_length = DEFAULT_FRAME_LENGTH;
+    size_t rx_offset = 0;
+    _Alignas(8) uint8_t rx_buffer[TEETH_BUFFER_SIZE];
     _Alignas(8) uint8_t tx_buffer[TEETH_MAX_ETHER_PACKET_SIZE + sizeof(struct teeth_eth_tx_req_hdr)];
-    _Alignas(8) uint8_t rx_buffer[TEETH_MAX_ETHER_PACKET_SIZE + sizeof(struct teeth_eth_tx_req_hdr)];
     struct teeth_eth_tx_req_hdr* const tx = (struct teeth_eth_tx_req_hdr*)tx_buffer;
+    struct teeth_base_hdr* const rx_base = (struct teeth_base_hdr*)rx_buffer;
     uint64_t tx_counter = 0;
     int64_t want_count = -1;
     uint16_t ether_type_net = htons(DEFAULT_ETHER_TYPE);
@@ -510,27 +513,122 @@ parse_src_mac:
                         goto Exit;
                     }
 
-                    // drain
-                    for (bool done = false; !done; ) {
-                        ssize_t r = recv(sock_fd, rx_buffer, sizeof(rx_buffer), 0);
+//                    // drain
+//                    for (bool done = false; !done; ) {
+//                        ssize_t r = recv(sock_fd, rx_buffer, sizeof(rx_buffer), 0);
 
-                        if (-1 == r) {
-                            switch (errno) {
-                            case EINTR:
-                                break;
-                            case EAGAIN:
-                                done = true;
-                                break;
-                            default:
-                                sys_error("recv");
-                                error = 2;
-                                goto Exit;
+//                        if (-1 == r) {
+//                            switch (errno) {
+//                            case EINTR:
+//                                break;
+//                            case EAGAIN:
+//                                done = true;
+//                                break;
+//                            default:
+//                                sys_error("recv");
+//                                error = 2;
+//                                goto Exit;
+//                            }
+//                        } else if (0 == r) {
+//                            log_debug1("server closed connection\n");
+//                            goto Exit;
+//                        }
+//                    }
+                    for (;;) {
+                        switch (state) {
+                        case STATE_READ_HEADER: {
+                            for (;;) {
+                                ssize_t r = recv(sock_fd, rx_buffer + rx_offset, sizeof(*rx_base) - rx_offset, 0);
+
+                                if (-1 == r) {
+                                    switch (errno) {
+                                    case EINTR:
+                                        break;
+                                    case EAGAIN:
+                                        goto done;
+                                    default:
+                                        sys_error("recv");
+                                        error = 2;
+                                        goto Exit;
+                                    }
+                                } else if (0 == r) {
+                                    log_error("server closed connection\n");
+                                    error = 3;
+                                    goto Exit;
+                                } else {
+                                    rx_offset += r;
+
+                                    if (rx_offset == sizeof(*rx_base)) {
+                                        teeth_net_to_host_base(rx_base);
+
+                                        switch (rx_base->version) {
+                                        case TEETH_PROTOCOL_VERSION:
+                                            if (rx_base->len < sizeof(*rx_base)) {
+                                                log_error("server sent short header, bailing\n");
+                                                error = 4;
+                                                goto Exit;
+                                            }
+
+                                            state = rx_base->len == sizeof(*rx_base) ? STATE_OP : STATE_READ_DATA;
+                                            break;
+                                        default:
+                                            log_error("unknown protocol version %u\n", rx_base->version);
+                                            error = 4;
+                                            goto Exit;
+                                        }
+                                        break;
+                                    }
+                                }
                             }
-                        } else if (0 == r) {
-                            log_debug1("server closed connection\n");
-                            goto Exit;
+                        } break;
+                        case STATE_READ_DATA: {
+                            for (;;) {
+                                ssize_t r = recv(sock_fd, rx_buffer + rx_offset, rx_base->len - rx_offset, 0);
+
+                                if (-1 == r) {
+                                    switch (errno) {
+                                    case EINTR:
+                                        break;
+                                    case EAGAIN:
+                                        goto done;
+                                    default:
+                                        sys_error("recv");
+                                        error = 2;
+                                        goto Exit;
+                                    }
+                                } else if (0 == r) {
+                                    log_error("server closed connection\n");
+                                    error = 3;
+                                    goto Exit;
+                                } else {
+                                    rx_offset += r;
+
+                                    if (rx_offset == rx_base->len) {
+                                        state = STATE_OP;
+                                        break;
+                                    }
+                                }
+                            }
+                        } break;
+                        case STATE_OP: {
+                            state = STATE_READ_HEADER;
+                            rx_offset = 0;
+
+                            switch (rx_base->msg_type) {
+                            case TEETH_MT_ETH_TX_RES: {
+                                struct teeth_eth_tx_res_hdr* tx_res = (struct teeth_eth_tx_res_hdr*)rx_buffer;
+
+                                teeth_net_to_host_eth_tx_res(tx_res);
+                                log_debug2("txe track id=%u error=%u\n", tx_res->track_id, tx_res->error);
+                            } break;
+                            default:
+                                break;
+                            }
+                        } break;
                         }
                     }
+done:
+                    ;
                 } else if (timer_fd == events[i].data.fd) {
                     if (events[i].events & EPOLLERR) {
                         log_error("timer failed");
@@ -566,8 +664,10 @@ parse_src_mac:
                     tx->base.len = tx_len;
                     tx->base.msg_type = TEETH_MT_ETH_TX_REQ;
                     tx->base.version = TEETH_PROTOCOL_VERSION;
-                    tx->flags = TEETH_TX_FLAG_SUPPRESS_RESPONSE;
+                    tx->flags = close_read_half ? TEETH_TX_FLAG_SUPPRESS_RESPONSE : 0;
                     tx->track_id = tx_counter;
+
+                    log_debug2("txr c=%" PRIu64 " track id=%u\n", tx_counter, tx->track_id);
 
                     teeth_net_to_host_base(&tx->base);
                     teeth_net_to_host_eth_tx_req(tx);

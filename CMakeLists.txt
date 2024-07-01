@@ -5,11 +5,16 @@ set(CMAKE_C_STANDARD 11)
 
 include_directories(inc)
 
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_definitions(-DNDEBUG=1)
+endif()
+
+
 add_library(lib STATIC
     src/lib.c
     src/lib.h)
 
-add_executable(teethd src/teethd.c)
+add_executable(teethd src/teethd.c inc/teeth.h)
 target_link_libraries(teethd PRIVATE lib)
 set_target_properties(teethd PROPERTIES PUBLIC_HEADER inc/teeth.h)
 

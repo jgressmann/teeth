@@ -1009,7 +1009,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                 }
             } break;
             default:
-                log_warn("unhandled message type %02x\n", base->msg_type);
+                log_warn("unhandle@d message type %02x\n", base->msg_type);
                 break;
             }
         } break;
@@ -1181,7 +1181,6 @@ static bool fetch_stats(app* app)
                 break;
             case EAGAIN:
                 done = true;
-                log_error("failed to retrieve interface statistics through rtnetlink\n");
                 break;
             default:
                 sys_error("rtnetlink recv");
@@ -1229,7 +1228,6 @@ static bool fetch_stats(app* app)
                 }
             }
         }
-        break;
     }
 
     return fetch_stats_glinksettings(app);
@@ -1435,7 +1433,7 @@ static bool on_packet_socket_event(app* app)
                 }
 
                 if (!tcp_send(app, fd, &rx_hdr, sizeof(rx_hdr)) || !tcp_send(app, fd, data, phdr->tp_snaplen)) {
-                    on_tcp_send_failed(app, fd);
+                    tcp_on_change(app, fd);
                     continue;
                 }
             }
@@ -1488,7 +1486,7 @@ static bool on_packet_socket_event(app* app)
             teeth_net_to_host_eth_tx_res(&tx_hdr);
 
             if (!tcp_send(app, priv->tx_res.fd, &tx_hdr, sizeof(tx_hdr))) {
-                on_tcp_send_failed(app, priv->tx_res.fd);
+                tcp_on_change(app, priv->tx_res.fd);
             }
         }
 
