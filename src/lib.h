@@ -239,6 +239,8 @@ static inline void teeth_net_to_host_eth_tx_res(struct teeth_eth_tx_res_hdr* hdr
 {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     hdr->track_id = __builtin_bswap16(hdr->track_id);
+    hdr->error = __builtin_bswap16(hdr->error);
+    hdr->ts_utc_nano = __builtin_bswap64(hdr->ts_utc_nano);
 #endif
 }
 

@@ -944,6 +944,7 @@ static bool on_tcp_event(app* app, struct epoll_event const* ev)
                         tx_res_hdr.base.version = TEETH_PROTOCOL_VERSION;
                         tx_res_hdr.track_id = tx_hdr->track_id;
                         tx_res_hdr.error = tcp->tx_error_code;
+                        tx_res_hdr.ts_utc_nano = now_utc();
 
                         teeth_net_to_host_base(&tx_res_hdr.base);
                         teeth_net_to_host_eth_tx_res(&tx_res_hdr);
@@ -1363,7 +1364,7 @@ static struct tcp_slot* tcp_new()
 static bool on_packet_socket_event(app* app)
 {
     struct teeth_eth_rx_hdr rx_hdr;
-    struct teeth_eth_tx_res_hdr tx_hdr;
+    struct teeth_eth_tx_res_hdr tx_res_hdr;
     bool fetch_stats = false;
 
 
@@ -1457,13 +1458,13 @@ static bool on_packet_socket_event(app* app)
         struct tpacket3_hdr* phdr = (struct tpacket3_hdr*)frame_base;
         struct tx_ring_frame_data_priv* priv = (struct tx_ring_frame_data_priv*)(frame_base + app->packet_ring_setup.tp_frame_size - TX_PRIVATE_DATA_SIZE);
 
-        tx_hdr.error = TEETH_TX_ERROR_NONE;
+        tx_res_hdr.error = TEETH_TX_ERROR_NONE;
 
         uint32_t tp_status = __atomic_load_n(&phdr->tp_status, __ATOMIC_ACQUIRE);
 
         if (unlikely(tp_status & TP_STATUS_WRONG_FORMAT)) {
             log_debug1("malformed packet\n");
-            tx_hdr.error = TEETH_TX_ERROR_MALFORMED;
+            tx_res_hdr.error = TEETH_TX_ERROR_MALFORMED;
             __atomic_store_n(&phdr->tp_status, TP_STATUS_AVAILABLE, __ATOMIC_RELEASE);
             tp_status = TP_STATUS_AVAILABLE;
         }
@@ -1476,16 +1477,17 @@ static bool on_packet_socket_event(app* app)
 
         if (priv->tx_res.echo &&
             app->fd_slot_ptr[priv->tx_res.fd].generation == priv->tx_res.generation) {
-            tx_hdr.base.len = sizeof(tx_hdr);
-            tx_hdr.base.msg_type = TEETH_MT_ETH_TX_RES;
-            tx_hdr.base.version = TEETH_PROTOCOL_VERSION;
-            tx_hdr.track_id = priv->tx_res.track_id;
-            tx_hdr.error = priv->tx_res.error;
+            tx_res_hdr.base.len = sizeof(tx_res_hdr);
+            tx_res_hdr.base.msg_type = TEETH_MT_ETH_TX_RES;
+            tx_res_hdr.base.version = TEETH_PROTOCOL_VERSION;
+            tx_res_hdr.track_id = priv->tx_res.track_id;
+            tx_res_hdr.error = priv->tx_res.error;
+            tx_res_hdr.ts_utc_nano = now_utc();
 
-            teeth_net_to_host_base(&tx_hdr.base);
-            teeth_net_to_host_eth_tx_res(&tx_hdr);
+            teeth_net_to_host_base(&tx_res_hdr.base);
+            teeth_net_to_host_eth_tx_res(&tx_res_hdr);
 
-            if (!tcp_send(app, priv->tx_res.fd, &tx_hdr, sizeof(tx_hdr))) {
+            if (!tcp_send(app, priv->tx_res.fd, &tx_res_hdr, sizeof(tx_res_hdr))) {
                 tcp_on_change(app, priv->tx_res.fd);
             }
         }

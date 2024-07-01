@@ -96,6 +96,7 @@ struct teeth_eth_tx_res_hdr {
     struct teeth_base_hdr base;
     uint32_t track_id : 16;
     uint32_t error : 16;
+    uint64_t ts_utc_nano;
 };
 
 #define TEETH_STATS_DUPLEX_MODE_HALF    0x0
