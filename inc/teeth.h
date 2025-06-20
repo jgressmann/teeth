@@ -22,6 +22,7 @@ extern "C" {
 #define TEETH_MAX_ETHER_PACKET_SIZE (1944-16) /* save 16 bytes per tx slot */
 
 #define TEETH_BUFFER_SIZE (sizeof(struct teeth_eth_rx_hdr) + TEETH_MAX_ETHER_PACKET_SIZE)
+#define TEETH_STATS_INTERVAL_S 1
 
 enum teeth_msg_type {
     /* echo request / response */

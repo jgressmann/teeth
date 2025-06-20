@@ -503,7 +503,7 @@ int main(int argc, char** argv)
             goto Exit;
         }
 
-        timer_setup.it_interval.tv_sec = 1;
+        timer_setup.it_interval.tv_sec = TEETH_STATS_INTERVAL_S;
         timer_setup.it_interval.tv_nsec = 0;
         timer_setup.it_value = timer_setup.it_interval;
 
